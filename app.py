@@ -54,9 +54,57 @@ CANDIDATE_DISTS = {
     "Uniform": stats.uniform,
     "Triangular": stats.triang,
     "Beta": stats.beta,
+    "Logistic": stats.logistic,
 }
 
+# Distributions whose support starts at zero — pin loc=0 during fitting
+# (matches reference implementation best practice)
+ZERO_LOWER_BOUND_DISTS = {"Exponential", "Gamma", "Log-Normal", "Weibull"}
+
 COMPETITOR_DIST_OPTIONS = ["Triangular", "Normal", "Uniform", "Log-Normal"]
+
+
+def compute_chi_square_gof(dist, params, data, max_bins=10):
+    """Chi-square goodness-of-fit test with bin merging (expected >= 5)."""
+    n = len(data)
+    quantiles = np.linspace(0, 1, max_bins + 1)
+    bin_edges = dist.ppf(quantiles, *params)
+    bin_edges[0], bin_edges[-1] = -np.inf, np.inf
+
+    distinct = [bin_edges[0]]
+    for e in bin_edges[1:]:
+        if e > distinct[-1]:
+            distinct.append(e)
+    if len(distinct) < 3:
+        return np.nan, np.nan
+
+    observed, _ = np.histogram(data, bins=np.array(distinct))
+    expected_per_bin = n / (len(distinct) - 1)
+
+    merged_obs, merged_exp = [], []
+    run_obs, run_exp = 0.0, 0.0
+    for obs in observed:
+        run_obs += float(obs)
+        run_exp += expected_per_bin
+        if run_exp >= 5:
+            merged_obs.append(run_obs)
+            merged_exp.append(run_exp)
+            run_obs, run_exp = 0.0, 0.0
+    if run_exp > 0:
+        if merged_exp:
+            merged_obs[-1] += run_obs
+            merged_exp[-1] += run_exp
+        else:
+            merged_obs.append(run_obs)
+            merged_exp.append(run_exp)
+
+    dof = len(merged_obs) - 1 - len(params)
+    if dof <= 0:
+        return np.nan, np.nan
+
+    chi2_stat = sum((o - e) ** 2 / e for o, e in zip(merged_obs, merged_exp))
+    p_value = 1 - stats.chi2.cdf(chi2_stat, dof)
+    return chi2_stat, p_value
 
 
 def fit_all_distributions(data):
@@ -65,12 +113,23 @@ def fit_all_distributions(data):
     n = len(data)
     for name, dist in CANDIDATE_DISTS.items():
         try:
-            params = dist.fit(data)
-            log_lik = np.sum(dist.logpdf(data, *params))
+            # Pin loc=0 for distributions with natural zero lower bound
+            if name in ZERO_LOWER_BOUND_DISTS:
+                params = dist.fit(data, floc=0)
+            else:
+                params = dist.fit(data)
+
+            log_lik_vals = dist.logpdf(data, *params)
+            if not np.all(np.isfinite(log_lik_vals)):
+                continue
+            log_lik = float(np.sum(log_lik_vals))
+
             k = len(params)
             aic = 2 * k - 2 * log_lik
             bic = k * np.log(n) - 2 * log_lik
             ks_stat, ks_p = stats.kstest(data, dist.cdf, args=params)
+            _, chi2_p = compute_chi_square_gof(dist, params, data)
+
             results.append({
                 "Distribution": name,
                 "Parameters": params,
@@ -79,6 +138,7 @@ def fit_all_distributions(data):
                 "BIC": bic,
                 "KS Statistic": ks_stat,
                 "KS p-value": ks_p,
+                "Chi-sq p-value": chi2_p,
                 "scipy_dist": dist,
             })
         except Exception:
@@ -215,6 +275,7 @@ with fit_col1:
         "AIC": f'{r["AIC"]:,.1f}',
         "KS Statistic": f'{r["KS Statistic"]:.4f}',
         "KS p-value": f'{r["KS p-value"]:.4f}',
+        "Chi-sq p-value": f'{r["Chi-sq p-value"]:.4f}' if np.isfinite(r["Chi-sq p-value"]) else "N/A",
     } for r in bp_fits])
     st.dataframe(bp_fit_df, use_container_width=True, hide_index=True)
 
@@ -251,6 +312,7 @@ with fit_col2:
         "AIC": f'{r["AIC"]:,.1f}',
         "KS Statistic": f'{r["KS Statistic"]:.4f}',
         "KS p-value": f'{r["KS p-value"]:.4f}',
+        "Chi-sq p-value": f'{r["Chi-sq p-value"]:.4f}' if np.isfinite(r["Chi-sq p-value"]) else "N/A",
     } for r in pc_fits])
     st.dataframe(pc_fit_df, use_container_width=True, hide_index=True)
 
